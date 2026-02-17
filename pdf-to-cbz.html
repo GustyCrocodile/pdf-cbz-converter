@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PDF → Binarized CBZ</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+
+<h1>PDF → Binarized CBZ</h1>
+
+<div>
+  <label>PDF file: <input type="file" id="pdfInput" accept=".pdf"></label>
+</div>
+
+<div>
+  <label>Scale (DPI multiplier):
+    <input type="number" id="scale" value="2" min="1" max="4" step="0.5">
+  </label>
+</div>
+
+<div>
+  <label>Binarization threshold (0–255):
+    <input type="number" id="threshold" value="128" min="0" max="255">
+  </label>
+</div>
+
+<div>
+  <button id="convertBtn" disabled>Convert to CBZ</button>
+</div>
+
+<div id="status"></div>
+<canvas id="preview" style="max-width:100%;border:1px solid #ccc;display:none;"></canvas>
+
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  const pdfInput   = document.getElementById('pdfInput');
+  const convertBtn = document.getElementById('convertBtn');
+  const statusEl   = document.getElementById('status');
+  const preview    = document.getElementById('preview');
+
+  let pdfData = null;
+
+  pdfInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const buffer = await file.arrayBuffer();
+    pdfData = new Uint8Array(buffer);
+    convertBtn.disabled = false;
+    setStatus(`Loaded "${file.name}". Ready to convert.`);
+  });
+
+  convertBtn.addEventListener('click', convertToCBZ);
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  /**
+   * Binarize an ImageData in-place.
+   * Converts to grayscale then applies a hard threshold.
+   */
+  function binarize(imageData, threshold) {
+    const d = imageData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const val  = gray >= threshold ? 255 : 0;
+      d[i] = d[i + 1] = d[i + 2] = val;
+      // alpha d[i+3] left at 255
+    }
+    return imageData;
+  }
+
+  async function convertToCBZ() {
+    if (!pdfData) return;
+
+    const scale     = parseFloat(document.getElementById('scale').value) || 2;
+    const threshold = parseInt(document.getElementById('threshold').value, 10);
+
+    convertBtn.disabled = true;
+    setStatus('Loading PDF…');
+
+    let pdf;
+    try {
+      pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
+    } catch (err) {
+      setStatus('Error loading PDF: ' + err.message);
+      convertBtn.disabled = false;
+      return;
+    }
+
+    const numPages = pdf.numPages;
+    const zip = new JSZip();
+    const ctx = preview.getContext('2d');
+    preview.style.display = 'block';
+
+    for (let p = 1; p <= numPages; p++) {
+      setStatus(`Processing page ${p} / ${numPages}…`);
+
+      const page     = await pdf.getPage(p);
+      const viewport = page.getViewport({ scale });
+
+      preview.width  = viewport.width;
+      preview.height = viewport.height;
+
+      // Render page to canvas
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      // Binarize
+      const imageData = ctx.getImageData(0, 0, preview.width, preview.height);
+      binarize(imageData, threshold);
+      ctx.putImageData(imageData, 0, 0);
+
+      // Export to PNG and add to ZIP
+      const blob        = await new Promise(res => preview.toBlob(res, 'image/png'));
+      const arrayBuffer = await blob.arrayBuffer();
+      const filename    = `page_${String(p).padStart(4, '0')}.png`;
+      zip.file(filename, arrayBuffer);
+    }
+
+    setStatus('Building CBZ archive…');
+    const cbzBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+
+    const url  = URL.createObjectURL(cbzBlob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'output.cbz';
+    a.click();
+    URL.revokeObjectURL(url);
+
+    setStatus(`Done! ${numPages} pages converted and downloaded as output.cbz`);
+    convertBtn.disabled = false;
+  }
+</script>
+
+</body>
+</html>
