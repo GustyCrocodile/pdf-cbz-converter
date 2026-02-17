@@ -13,126 +13,290 @@
 <div>
   <label>PDF file: <input type="file" id="pdfInput" accept=".pdf"></label>
 </div>
-
 <div>
   <label>Scale (DPI multiplier):
     <input type="number" id="scale" value="2" min="1" max="4" step="0.5">
   </label>
 </div>
-
 <div>
-  <label>Binarization threshold (0–255):
-    <input type="number" id="threshold" value="128" min="0" max="255">
+  <label>Sensitivity (Sauvola k — higher = darker output):
+    <input type="number" id="sensitivity" value="0.2" min="0.05" max="0.5" step="0.05">
   </label>
 </div>
-
 <div>
-  <button id="convertBtn" disabled>Convert to CBZ</button>
+  <button id="previewBtn"  disabled>Preview page 1</button>
+  <button id="convertBtn"  disabled>Convert all pages → CBZ</button>
 </div>
-
 <div id="status"></div>
 <canvas id="preview" style="max-width:100%;border:1px solid #ccc;display:none;"></canvas>
 
 <script>
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-  const pdfInput   = document.getElementById('pdfInput');
-  const convertBtn = document.getElementById('convertBtn');
-  const statusEl   = document.getElementById('status');
-  const preview    = document.getElementById('preview');
+const pdfInput   = document.getElementById('pdfInput');
+const convertBtn = document.getElementById('convertBtn');
+const previewBtn = document.getElementById('previewBtn');
+const statusEl   = document.getElementById('status');
+const canvas     = document.getElementById('preview');
 
-  let pdfData = null;
+let pdfData = null;
 
-  pdfInput.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const buffer = await file.arrayBuffer();
-    pdfData = new Uint8Array(buffer);
-    convertBtn.disabled = false;
-    setStatus(`Loaded "${file.name}". Ready to convert.`);
-  });
+pdfInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  pdfData = new Uint8Array(await file.arrayBuffer());
+  convertBtn.disabled = false;
+  previewBtn.disabled = false;
+  setStatus(`Loaded "${file.name}". Ready.`);
+});
 
-  convertBtn.addEventListener('click', convertToCBZ);
+previewBtn.addEventListener('click', async () => {
+  if (!pdfData) return;
+  setStatus('Rendering preview…');
+  const pdf  = await pdfjsLib.getDocument({ data: pdfData }).promise;
+  const page = await pdf.getPage(1);
+  const scale       = parseFloat(document.getElementById('scale').value) || 2;
+  const sensitivity = parseFloat(document.getElementById('sensitivity').value);
+  const gray   = await renderPageToGray(page, scale);
+  const binary = binarizeCombined(gray.data, gray.width, gray.height, sensitivity);
+  drawBinaryToCanvas(canvas, binary, gray.width, gray.height);
+  canvas.style.display = 'block';
+  setStatus('Preview done (page 1).');
+});
 
-  function setStatus(msg) { statusEl.textContent = msg; }
+convertBtn.addEventListener('click', convertToCBZ);
 
-  /**
-   * Binarize an ImageData in-place.
-   * Converts to grayscale then applies a hard threshold.
-   */
-  function binarize(imageData, threshold) {
-    const d = imageData.data;
-    for (let i = 0; i < d.length; i += 4) {
-      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      const val  = gray >= threshold ? 255 : 0;
-      d[i] = d[i + 1] = d[i + 2] = val;
-      // alpha d[i+3] left at 255
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// ─── Rendering helpers ────────────────────────────────────────────────────────
+
+const offscreen = document.createElement('canvas');
+const offCtx    = offscreen.getContext('2d');
+
+async function renderPageToGray(page, scale) {
+  const viewport = page.getViewport({ scale });
+  offscreen.width  = viewport.width;
+  offscreen.height = viewport.height;
+  await page.render({ canvasContext: offCtx, viewport }).promise;
+  const { data } = offCtx.getImageData(0, 0, viewport.width, viewport.height);
+  const gray = new Uint8Array(viewport.width * viewport.height);
+  for (let i = 0; i < gray.length; i++) {
+    const p = i * 4;
+    gray[i] = (0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]) | 0;
+  }
+  return { data: gray, width: viewport.width, height: viewport.height };
+}
+
+function drawBinaryToCanvas(c, binary, width, height) {
+  c.width  = width;
+  c.height = height;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(width, height);
+  for (let i = 0; i < binary.length; i++) {
+    img.data[i * 4]     = binary[i];
+    img.data[i * 4 + 1] = binary[i];
+    img.data[i * 4 + 2] = binary[i];
+    img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// ─── Integral images ──────────────────────────────────────────────────────────
+
+function buildIntegrals(gray, width, height) {
+  const W     = width + 1;
+  const sum   = new Float64Array(W * (height + 1));
+  const sqsum = new Float64Array(W * (height + 1));
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const v = gray[y * width + x];
+      const i = (y + 1) * W + (x + 1);
+      const a = y * W + (x + 1);
+      const b = (y + 1) * W + x;
+      const c = y * W + x;
+      sum  [i] = v     + sum  [a] + sum  [b] - sum  [c];
+      sqsum[i] = v * v + sqsum[a] + sqsum[b] - sqsum[c];
     }
-    return imageData;
+  }
+  return { sum, sqsum, W };
+}
+
+// ─── Method 1: Sauvola adaptive thresholding ──────────────────────────────────
+// T(x,y) = mean * (1 + k * (std / R - 1))   R = 128
+// Pixel < T → black; else white
+
+function sauvolaBinarize(gray, width, height, windowSize, k) {
+  const R    = 128;
+  const half = windowSize >> 1;
+  const { sum, sqsum, W } = buildIntegrals(gray, width, height);
+  const out  = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const x1 = Math.max(0,         x - half);
+      const y1 = Math.max(0,         y - half);
+      const x2 = Math.min(width  - 1, x + half);
+      const y2 = Math.min(height - 1, y + half);
+      const n  = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+      const s  = sum  [(y2+1)*W+(x2+1)] - sum  [y1*W+(x2+1)] - sum  [(y2+1)*W+x1] + sum  [y1*W+x1];
+      const sq = sqsum[(y2+1)*W+(x2+1)] - sqsum[y1*W+(x2+1)] - sqsum[(y2+1)*W+x1] + sqsum[y1*W+x1];
+
+      const mean = s / n;
+      const std  = Math.sqrt(Math.max(0, sq / n - mean * mean));
+      const T    = mean * (1 + k * (std / R - 1));
+
+      out[y * width + x] = gray[y * width + x] < T ? 0 : 255;
+    }
+  }
+  return out;
+}
+
+// ─── Method 2: Adaptive Otsu with background normalization ────────────────────
+// 1. Split into blocks; background = 90th-percentile grayscale value per block
+// 2. Bilinear-interpolate a smooth background map
+// 3. Normalize: pixel / background * 255
+// 4. Apply global Otsu threshold on the normalized image
+
+function otsuThreshold(gray) {
+  const hist = new Int32Array(256);
+  for (const v of gray) hist[v]++;
+  const n = gray.length;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, maxVar = 0, T = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (!wB) continue;
+    const wF = n - wB;
+    if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) ** 2;
+    if (v > maxVar) { maxVar = v; T = t; }
+  }
+  return T;
+}
+
+function adaptiveOtsuBinarize(gray, width, height, blockSize) {
+  const cols = Math.ceil(width  / blockSize);
+  const rows = Math.ceil(height / blockSize);
+  const bg   = new Float32Array(rows * cols);
+
+  for (let by = 0; by < rows; by++) {
+    for (let bx = 0; bx < cols; bx++) {
+      const x1 = bx * blockSize, x2 = Math.min(width,  x1 + blockSize);
+      const y1 = by * blockSize, y2 = Math.min(height, y1 + blockSize);
+      const vals = [];
+      for (let y = y1; y < y2; y++)
+        for (let x = x1; x < x2; x++)
+          vals.push(gray[y * width + x]);
+      vals.sort((a, b) => a - b);
+      bg[by * cols + bx] = vals[Math.floor(vals.length * 0.9)] || 255;
+    }
   }
 
-  async function convertToCBZ() {
-    if (!pdfData) return;
+  const normalized = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const bxf = x / blockSize - 0.5;
+      const byf = y / blockSize - 0.5;
+      const bx0 = Math.max(0,        Math.floor(bxf));
+      const by0 = Math.max(0,        Math.floor(byf));
+      const bx1 = Math.min(cols - 1, bx0 + 1);
+      const by1 = Math.min(rows - 1, by0 + 1);
+      const tx  = Math.max(0, bxf - bx0);
+      const ty  = Math.max(0, byf - by0);
 
-    const scale     = parseFloat(document.getElementById('scale').value) || 2;
-    const threshold = parseInt(document.getElementById('threshold').value, 10);
+      const bgVal =
+        bg[by0 * cols + bx0] * (1 - tx) * (1 - ty) +
+        bg[by0 * cols + bx1] *       tx * (1 - ty) +
+        bg[by1 * cols + bx0] * (1 - tx) *       ty +
+        bg[by1 * cols + bx1] *       tx *       ty;
 
-    convertBtn.disabled = true;
-    setStatus('Loading PDF…');
-
-    let pdf;
-    try {
-      pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
-    } catch (err) {
-      setStatus('Error loading PDF: ' + err.message);
-      convertBtn.disabled = false;
-      return;
+      const pix = gray[y * width + x];
+      normalized[y * width + x] = bgVal > 0 ? Math.min(255, (pix / bgVal) * 255) | 0 : pix;
     }
-
-    const numPages = pdf.numPages;
-    const zip = new JSZip();
-    const ctx = preview.getContext('2d');
-    preview.style.display = 'block';
-
-    for (let p = 1; p <= numPages; p++) {
-      setStatus(`Processing page ${p} / ${numPages}…`);
-
-      const page     = await pdf.getPage(p);
-      const viewport = page.getViewport({ scale });
-
-      preview.width  = viewport.width;
-      preview.height = viewport.height;
-
-      // Render page to canvas
-      await page.render({ canvasContext: ctx, viewport }).promise;
-
-      // Binarize
-      const imageData = ctx.getImageData(0, 0, preview.width, preview.height);
-      binarize(imageData, threshold);
-      ctx.putImageData(imageData, 0, 0);
-
-      // Export to PNG and add to ZIP
-      const blob        = await new Promise(res => preview.toBlob(res, 'image/png'));
-      const arrayBuffer = await blob.arrayBuffer();
-      const filename    = `page_${String(p).padStart(4, '0')}.png`;
-      zip.file(filename, arrayBuffer);
-    }
-
-    setStatus('Building CBZ archive…');
-    const cbzBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
-
-    const url  = URL.createObjectURL(cbzBlob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = 'output.cbz';
-    a.click();
-    URL.revokeObjectURL(url);
-
-    setStatus(`Done! ${numPages} pages converted and downloaded as output.cbz`);
-    convertBtn.disabled = false;
   }
+
+  const T   = otsuThreshold(normalized);
+  const out = new Uint8Array(width * height);
+  for (let i = 0; i < out.length; i++) out[i] = normalized[i] < T ? 0 : 255;
+  return out;
+}
+
+// ─── Combined binarization ────────────────────────────────────────────────────
+// Window size = 1/40 of smaller dimension, clamped to [31, 101], forced odd
+// Union: pixel is black if EITHER method says black → maximises text recovery
+
+function binarizeCombined(gray, width, height, sensitivity) {
+  let win = Math.round(Math.min(width, height) / 40);
+  win = Math.max(31, Math.min(101, win));
+  if (win % 2 === 0) win++;
+
+  const sauvola = sauvolaBinarize(gray, width, height, win, sensitivity);
+  const aotsu   = adaptiveOtsuBinarize(gray, width, height, win);
+
+  const out = new Uint8Array(width * height);
+  for (let i = 0; i < out.length; i++)
+    out[i] = (sauvola[i] === 0 || aotsu[i] === 0) ? 0 : 255;
+  return out;
+}
+
+// ─── Main conversion ──────────────────────────────────────────────────────────
+
+async function convertToCBZ() {
+  if (!pdfData) return;
+  const scale       = parseFloat(document.getElementById('scale').value) || 2;
+  const sensitivity = parseFloat(document.getElementById('sensitivity').value);
+
+  convertBtn.disabled = true;
+  previewBtn.disabled = true;
+  setStatus('Loading PDF…');
+
+  let pdf;
+  try {
+    pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
+  } catch (err) {
+    setStatus('Error loading PDF: ' + err.message);
+    convertBtn.disabled = false;
+    previewBtn.disabled = false;
+    return;
+  }
+
+  const numPages = pdf.numPages;
+  const zip = new JSZip();
+
+  for (let p = 1; p <= numPages; p++) {
+    setStatus(`Processing page ${p} / ${numPages}…`);
+    await new Promise(r => setTimeout(r, 0)); // yield to UI
+
+    const page   = await pdf.getPage(p);
+    const gray   = await renderPageToGray(page, scale);
+    const binary = binarizeCombined(gray.data, gray.width, gray.height, sensitivity);
+
+    drawBinaryToCanvas(canvas, binary, gray.width, gray.height);
+    canvas.style.display = 'block';
+
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+    zip.file(`page_${String(p).padStart(4, '0')}.png`, await blob.arrayBuffer());
+  }
+
+  setStatus('Building CBZ archive…');
+  const cbzBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+
+  const url  = URL.createObjectURL(cbzBlob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = 'output.cbz';
+  a.click();
+  URL.revokeObjectURL(url);
+
+  setStatus(`Done! ${numPages} pages → output.cbz`);
+  convertBtn.disabled = false;
+  previewBtn.disabled = false;
+}
 </script>
-
 </body>
 </html>
